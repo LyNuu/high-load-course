@@ -2,6 +2,7 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Metrics
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -42,6 +43,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private val parallelWindow = OngoingWindow(parallelRequests)
 
+    private val outgoingCounter = Metrics.counter("shop.payments.outgoing", "account", accountName)
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
@@ -65,6 +68,8 @@ class PaymentExternalSystemAdapterImpl(
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
             }.build()
+
+            outgoingCounter.increment()
 
             client.newCall(request).execute().use { response ->
                 val body = try {
