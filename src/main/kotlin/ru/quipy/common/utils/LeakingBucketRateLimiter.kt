@@ -1,3 +1,4 @@
+
 package ru.quipy.common.utils
 
 import java.time.Duration
@@ -5,7 +6,7 @@ import java.time.Duration
 class LeakingBucketRateLimiter(
     private val rate: Long,
     private val window: Duration,
-    bucketSize: Int,
+    private val bucketSize: Int,
 ) : RateLimiter {
 
     init {
@@ -14,15 +15,16 @@ class LeakingBucketRateLimiter(
     }
 
     private val intervalNanos = window.toNanos() / rate
-
-    private val burstNanos =
-        (bucketSize - 1L) * intervalNanos
-
     private var nextAllowedTime = System.nanoTime()
 
+    override fun tick(): Boolean = tick(bucketSize)
+
     @Synchronized
-    override fun tick(): Boolean {
+    fun tick(burstSize: Int): Boolean {
+        require(burstSize > 0)
+
         val currentTime = System.nanoTime()
+        val burstNanos = (burstSize - 1L) * intervalNanos
 
         if (currentTime < nextAllowedTime - burstNanos) {
             return false

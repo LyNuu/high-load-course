@@ -18,7 +18,7 @@ class APIController {
 
     val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
     private val ingressLimiter = LeakingBucketRateLimiter(
-        rate = 11,
+        rate = 10,
         window = Duration.ofSeconds(1),
         bucketSize = 11
     )
@@ -71,7 +71,11 @@ class APIController {
         response: HttpServletResponse
     ): PaymentSubmissionDto {
 
-        if (!ingressLimiter.tick()) {
+        val remainingMs = deadline - System.currentTimeMillis()
+
+        val bucketSize = if (remainingMs >= 20_000L) 320 else 11
+
+        if (!ingressLimiter.tick(bucketSize)) {
             response.setHeader("Retry-After", "1")
 
             throw ResponseStatusException(
