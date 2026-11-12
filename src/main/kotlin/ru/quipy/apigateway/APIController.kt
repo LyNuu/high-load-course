@@ -20,7 +20,7 @@ class APIController {
     private val ingressLimiter = LeakingBucketRateLimiter(
         rate = 11,
         window = Duration.ofSeconds(1),
-        bucketSize = 10
+        bucketSize = 11
     )
 
     @Autowired
