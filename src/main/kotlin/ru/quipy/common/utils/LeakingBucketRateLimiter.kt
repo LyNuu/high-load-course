@@ -1,37 +1,36 @@
 package ru.quipy.common.utils
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
 import java.time.Duration
-import java.util.concurrent.Executors
-import java.util.concurrent.LinkedBlockingQueue
 
 class LeakingBucketRateLimiter(
     private val rate: Long,
     private val window: Duration,
     bucketSize: Int,
 ) : RateLimiter {
-    private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
-    private val queue = LinkedBlockingQueue<Int>(bucketSize)
 
-    override fun tick(): Boolean {
-        return queue.offer(1)
+    init {
+        require(rate > 0)
+        require(bucketSize > 0)
     }
 
-    private val releaseJob = rateLimiterScope.launch {
-        while (true) {
-            delay(window.toMillis())
-            for (i in 0..rate) {
-                queue.poll()
-            }
-        }
-    }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
+    private val intervalNanos = window.toNanos() / rate
 
-    companion object {
-        private val logger: Logger = LoggerFactory.getLogger(LeakingBucketRateLimiter::class.java)
+    private val burstNanos =
+        (bucketSize - 1L) * intervalNanos
+
+    private var nextAllowedTime = System.nanoTime()
+
+    @Synchronized
+    override fun tick(): Boolean {
+        val currentTime = System.nanoTime()
+
+        if (currentTime < nextAllowedTime - burstNanos) {
+            return false
+        }
+
+        nextAllowedTime =
+            maxOf(currentTime, nextAllowedTime) + intervalNanos
+
+        return true
     }
 }
