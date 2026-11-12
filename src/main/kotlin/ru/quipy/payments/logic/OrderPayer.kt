@@ -1,8 +1,6 @@
-
 package ru.quipy.payments.logic
 
 import io.micrometer.core.instrument.Metrics
-import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
@@ -21,7 +19,7 @@ import java.util.concurrent.TimeUnit
 class OrderPayer {
 
     companion object {
-        val logger: Logger =
+        private val logger =
             LoggerFactory.getLogger(OrderPayer::class.java)
     }
 
@@ -55,19 +53,20 @@ class OrderPayer {
         paymentId: UUID,
         deadline: Long
     ): Long {
+
         incomingCounter.increment()
 
         val createdAt = System.currentTimeMillis()
 
         try {
-            paymentExecutor.submit {
-                val taskStartedAt = System.currentTimeMillis()
-                val queueWaitMs = taskStartedAt - createdAt
+            paymentExecutor.execute {
+                val taskStarted = System.currentTimeMillis()
+                val queueWaitMs = taskStarted - createdAt
+
+                val dbStarted = System.nanoTime()
 
                 try {
-                    // Измеряем время создания платежа в Event Sourcing.
-                    val dbStart = System.nanoTime()
-
+                    // Создание платежа в Event Sourcing.
                     val createdEvent = paymentESService.create {
                         it.create(
                             paymentId,
@@ -77,12 +76,14 @@ class OrderPayer {
                     }
 
                     val dbCreateMs =
-                        (System.nanoTime() - dbStart) / 1_000_000
+                        TimeUnit.NANOSECONDS.toMillis(
+                            System.nanoTime() - dbStarted
+                        )
 
                     val remainingMs =
                         deadline - System.currentTimeMillis()
 
-                    // Логируем медленные операции.
+                    // Диагностика долгих операций.
                     if (queueWaitMs > 100L || dbCreateMs > 200L) {
                         logger.warn(
                             "[PAYMENT-DIAG] [ORDER_TIMING] " +
@@ -98,7 +99,6 @@ class OrderPayer {
                         )
                     }
 
-                    // Диагностика просроченных платежей.
                     if (remainingMs <= 0L) {
                         logger.warn(
                             "[PAYMENT-DIAG] [DEADLINE_ALREADY_EXPIRED] " +
@@ -110,13 +110,13 @@ class OrderPayer {
                     }
 
                     logger.trace(
-                        "Payment ${createdEvent.paymentId} " +
-                                "for order $orderId created."
+                        "Payment {} for order {} created.",
+                        createdEvent.paymentId,
+                        orderId
                     )
 
-                    // Не меняем бизнес-логику:
-                    // передаём платёж дальше даже при истёкшем deadline.
-                    // Это сохраняет обработку событий Event Sourcing.
+                    // Передаём платёж дальше.
+                    // Не пропускаем обязательные события.
                     paymentService.submitPaymentRequest(
                         paymentId,
                         amount,
