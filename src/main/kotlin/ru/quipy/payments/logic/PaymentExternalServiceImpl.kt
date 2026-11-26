@@ -122,17 +122,35 @@ class PaymentExternalSystemAdapterImpl(
                     lastSubmittedTxId = transactionId
                 }
 
-                val attemptResult = performAttempt(
-                    paymentId = paymentId,
-                    transactionId = transactionId,
-                    amount = amount,
-                    deadline = deadline,
-                    attempt = attempt,
-                    attemptsLeft = maxAttempts - attempt + 1
-                ) {
-                    recordSubmission(paymentId, transactionId, paymentStartedAt, deadline)
-                    lastSubmittedTxId = transactionId
-                    lastResult = null
+                var retryDispatchedAt: Long? = null
+                val attemptResult = try {
+                    performAttempt(
+                        paymentId = paymentId,
+                        transactionId = transactionId,
+                        amount = amount,
+                        deadline = deadline,
+                        attempt = attempt,
+                        attemptsLeft = maxAttempts - attempt + 1,
+                        prepareRetry = {
+                            // Подготовленная запись остаётся с success=false, если ретрай пропущен.
+                            recordSubmission(paymentId, transactionId, paymentStartedAt, deadline, success = false)
+                        },
+                        onRetryDispatch = {
+                            retryDispatchedAt = now()
+                            lastSubmittedTxId = transactionId
+                            lastResult = null
+                        }
+                    )
+                } finally {
+                    val dispatchedAt = retryDispatchedAt
+                    if (dispatchedAt != null) {
+                        try {
+                            recordSubmission(paymentId, transactionId, paymentStartedAt, deadline, submittedAt = dispatchedAt)
+                        } catch (e: Exception) {
+                            if (e is InterruptedException) Thread.currentThread().interrupt()
+                            logger.error("[CASE7] RETRY_DISPATCH_RECORD_FAILED paymentId={} transactionId={}", paymentId, transactionId, e)
+                        }
+                    }
                 } ?: break
 
                 lastResult = attemptResult.value
@@ -190,15 +208,17 @@ class PaymentExternalSystemAdapterImpl(
         paymentId: UUID,
         transactionId: UUID,
         paymentStartedAt: Long,
-        deadline: Long
+        deadline: Long,
+        success: Boolean = true,
+        submittedAt: Long = now()
     ) {
         val started = System.nanoTime()
         paymentESService.update(paymentId) {
             it.logSubmission(
-                success = true,
+                success,
                 transactionId,
-                now(),
-                Duration.ofMillis((now() - paymentStartedAt).coerceAtLeast(0L))
+                submittedAt,
+                Duration.ofMillis((submittedAt - paymentStartedAt).coerceAtLeast(0L))
             )
         }
         val elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
@@ -217,7 +237,8 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long,
         attempt: Int,
         attemptsLeft: Int,
-        recordRetry: () -> Unit
+        prepareRetry: () -> Unit,
+        onRetryDispatch: () -> Unit
     ): AttemptResult? {
         fun skip(reason: String): AttemptResult? {
             if (attempt > 1) {
@@ -234,8 +255,18 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         try {
+            if (attempt > 1) {
+                if (deadline - now() < minimumAttemptMs + waitReserveMs) {
+                    return skip("Not enough time to prepare retry")
+                }
+                prepareRetry()
+            }
+
             val waitBudget = deadline - now() - minimumAttemptMs - waitReserveMs
-            if (waitBudget < 0L || !acquireRatePermit(waitBudget)) {
+            if (waitBudget < 0L) {
+                return skip("Not enough time to process payment")
+            }
+            if (!acquireRatePermit(waitBudget)) {
                 return skip("Insufficient time for rate limiter")
             }
 
@@ -278,7 +309,7 @@ class PaymentExternalSystemAdapterImpl(
             }
             call.timeout().deadlineNanoTime(callDeadlineNs)
             if (attempt > 1) {
-                recordRetry()
+                onRetryDispatch()
                 retryCounter.increment()
             }
             outgoingCounter.increment()

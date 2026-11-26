@@ -1,6 +1,5 @@
 package ru.quipy.payments.logic
 
-import io.micrometer.core.instrument.Metrics
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
@@ -45,9 +44,6 @@ class OrderPayer {
         ThreadPoolExecutor.AbortPolicy()
     )
 
-    private val incomingCounter =
-        Metrics.counter("shop.payments.incoming")
-
     fun processPayment(
         orderId: UUID,
         amount: Int,
@@ -55,8 +51,6 @@ class OrderPayer {
         deadline: Long,
         onAdmitted: () -> Unit
     ): Long {
-
-        incomingCounter.increment()
 
         val createdAt = System.currentTimeMillis()
         val orderSaved = CompletableFuture<Boolean>()

@@ -1,5 +1,6 @@
 package ru.quipy.apigateway
 
+import io.micrometer.core.instrument.Metrics
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -16,6 +17,7 @@ import java.util.*
 class APIController {
 
     val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
+    private val incomingCounter = Metrics.counter("shop.payments.incoming")
     private val ingressLimiter = LeakingBucketRateLimiter(
         rate = 10,
         window = Duration.ofSeconds(1),
@@ -68,7 +70,7 @@ class APIController {
         @PathVariable orderId: UUID,
         @RequestParam deadline: Long
     ): PaymentSubmissionDto {
-
+        incomingCounter.increment()
         val remainingMs = deadline - System.currentTimeMillis()
 
         val bucketSize = if (remainingMs >= 20_000L) 320 else 11
