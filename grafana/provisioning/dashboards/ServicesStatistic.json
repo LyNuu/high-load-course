@@ -3468,6 +3468,48 @@
       ],
       "title": "Jetty Statistics",
       "type": "row"
+    },
+    {
+      "type": "row",
+      "title": "Shop metrics",
+      "collapsed": true,
+      "id": 900,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 7 },
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "(Online shop -> Payment system) Outgoing requests rate (rps), custom",
+          "id": 901,
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "fieldConfig": {
+            "defaults": { "unit": "reqps", "min": 0 },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true },
+            "tooltip": { "mode": "multi", "sort": "none" }
+          },
+          "targets": [
+            {
+              "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+              "editorMode": "code",
+              "expr": "sum by (account) (rate(shop_payments_outgoing_total[30s]))",
+              "legendFormat": "outgoing - {{account}}",
+              "range": true,
+              "refId": "A"
+            },
+            {
+              "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+              "editorMode": "code",
+              "expr": "rate(shop_payments_incoming_total[30s])",
+              "legendFormat": "incoming",
+              "range": true,
+              "refId": "B"
+            }
+          ]
+        }
+      ]
     }
   ],
   "preload": false,

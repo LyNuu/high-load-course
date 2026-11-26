@@ -13,8 +13,7 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
-import java.util.*
-
+import java.util.UUID
 
 @Configuration
 class PaymentAccountsConfig {
@@ -35,10 +34,16 @@ class PaymentAccountsConfig {
     @Value("#{'\${payment.accounts}'.split(',')}")
     lateinit var allowedAccounts: List<String>
 
+    // Базовая настройка видна в Docker с профилем default.
+    @Value("\${payment.retry.server-timeout-enabled:false}")
+    var serverTimeoutRetryEnabled: Boolean = false
+
     @Bean
-    fun accountAdapters(paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>): List<PaymentExternalSystemAdapter> {
+    fun accountAdapters(
+        paymentService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
+    ): List<PaymentExternalSystemAdapter> {
         val request = HttpRequest.newBuilder()
-            .uri(URI("http://${paymentProviderHostPort}/external/accounts?serviceName=$serviceName&token=$token"))
+            .uri(URI("http://$paymentProviderHostPort/external/accounts?serviceName=$serviceName&token=$token"))
             .GET()
             .build()
 
@@ -57,7 +62,8 @@ class PaymentAccountsConfig {
                     it,
                     paymentService,
                     paymentProviderHostPort,
-                    token
+                    token,
+                    serverTimeoutRetryEnabled = serverTimeoutRetryEnabled
                 )
             }
     }

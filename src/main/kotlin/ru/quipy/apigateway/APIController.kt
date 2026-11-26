@@ -1,17 +1,28 @@
 package ru.quipy.apigateway
 
+import io.micrometer.core.instrument.Metrics
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.http.HttpStatus
 import org.springframework.web.bind.annotation.*
+import org.springframework.web.server.ResponseStatusException
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
+import java.time.Duration
 import java.util.*
 
 @RestController
 class APIController {
 
     val logger: Logger = LoggerFactory.getLogger(APIController::class.java)
+    private val incomingCounter = Metrics.counter("shop.payments.incoming")
+    private val ingressLimiter = LeakingBucketRateLimiter(
+        rate = 10,
+        window = Duration.ofSeconds(1),
+        bucketSize = 11
+    )
 
     @Autowired
     private lateinit var orderRepository: OrderRepository
@@ -55,15 +66,28 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto {
+    fun payOrder(
+        @PathVariable orderId: UUID,
+        @RequestParam deadline: Long
+    ): PaymentSubmissionDto {
+        incomingCounter.increment()
+        val remainingMs = deadline - System.currentTimeMillis()
+
+        val bucketSize = if (remainingMs >= 20_000L) 320 else 11
+
+        if (!ingressLimiter.tick(bucketSize)) {
+            throw ResponseStatusException(
+                HttpStatus.TOO_MANY_REQUESTS,
+                "Ingress rate limit exceeded"
+            )
+        }
         val paymentId = UUID.randomUUID()
-        val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-            it
-        } ?: throw IllegalArgumentException("No such order $orderId")
+        val order = orderRepository.findById(orderId)
+            ?: throw IllegalArgumentException("No such order $orderId")
 
-
-        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline) {
+            orderRepository.save(order.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
+        }
         return PaymentSubmissionDto(createdAt, paymentId)
     }
 

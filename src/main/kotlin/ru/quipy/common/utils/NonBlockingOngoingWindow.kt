@@ -1,6 +1,7 @@
 package ru.quipy.common.utils
 
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class OngoingWindow(
@@ -11,6 +12,8 @@ class OngoingWindow(
     fun acquire() {
         window.acquire()
     }
+
+    fun tryAcquire(timeoutMs: Long): Boolean = window.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)
 
     fun release() = window.release()
 
