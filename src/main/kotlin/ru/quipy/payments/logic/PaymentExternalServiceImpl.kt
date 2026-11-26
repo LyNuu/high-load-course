@@ -63,7 +63,7 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimiter = SlidingWindowRateLimiter(
         properties.rateLimitPerSec.toLong(), Duration.ofSeconds(1)
     )
-    private val pacedLimiter = if (enabledRetries) PacedLimiter(ACC7_SPACING_MS) else null
+    private val pacedLimiter = if (enabledRetries) PacedLimiter(ACC7_SPACING_MS, rateLimiter) else null
     private val parallelWindow = OngoingWindow(properties.parallelRequests)
 
     private val outgoingCounter = Metrics.counter("shop.payments.outgoing", "account", accountName)
@@ -87,9 +87,10 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
         deadline: Long
     ) {
-        var lastTxId = UUID.randomUUID()
         val maxAttempts = if (enabledRetries) MAX_ATTEMPTS else 1
+        var lastSubmittedTxId: UUID? = null
         var lastResult: ExternalSysResponse? = null
+        var failureReason = "No provider attempt completed"
 
         try {
             for (attempt in 1..maxAttempts) {
@@ -100,13 +101,15 @@ class PaymentExternalSystemAdapterImpl(
                     break
                 }
 
-                if (attempt > 1) lastTxId = UUID.randomUUID()
-                recordSubmission(paymentId, lastTxId, paymentStartedAt, deadline)
+                val transactionId = UUID.randomUUID()
+                recordSubmission(paymentId, transactionId, paymentStartedAt, deadline)
+                lastSubmittedTxId = transactionId
+                lastResult = null
 
                 val attemptResult = try {
                     performAttempt(
                         paymentId = paymentId,
-                        transactionId = lastTxId,
+                        transactionId = transactionId,
                         amount = amount,
                         deadline = deadline,
                         attempt = attempt,
@@ -118,7 +121,7 @@ class PaymentExternalSystemAdapterImpl(
                         "[CASE7] NETWORK_TIMEOUT_NO_RETRY account={} paymentId={} attempt={} remainingMs={} error={}",
                         accountName, paymentId, attempt, deadline - now(), e.javaClass.simpleName
                     )
-                    lastResult = failure(paymentId, lastTxId, "Request timeout.")
+                    lastResult = failure(paymentId, transactionId, "Request timeout.")
                     break
                 }
 
@@ -140,12 +143,13 @@ class PaymentExternalSystemAdapterImpl(
         } catch (e: Exception) {
             if (e is InterruptedException) Thread.currentThread().interrupt()
             logger.error("[CASE7] PAYMENT_EXCEPTION account={} paymentId={}", accountName, paymentId, e)
-            if (lastResult == null) lastResult = failure(paymentId, lastTxId, e.message ?: "Payment error")
+            failureReason = "Payment error: ${e.message ?: e.javaClass.simpleName}"
         }
 
-        val result = lastResult ?: failure(paymentId, lastTxId, "No provider attempt completed")
-        if (!result.result) {
-            val message = result.message.orEmpty()
+        val succeeded = lastResult?.result == true
+        val reason = if (lastResult == null) failureReason else lastResult.message
+        if (!succeeded) {
+            val message = reason.orEmpty()
             val failureType = when {
                 message.contains("rate limiter", ignoreCase = true) -> "rate_wait"
                 message.contains("deadline", ignoreCase = true) ||
@@ -163,11 +167,11 @@ class PaymentExternalSystemAdapterImpl(
         }
         logger.info(
             "[{}] Payment processed: paymentId={}, succeeded={}, reason={}",
-            accountName, paymentId, result.result, result.message
+            accountName, paymentId, succeeded, reason
         )
         // Одно финальное событие Processing после всех попыток.
         paymentESService.update(paymentId) {
-            it.logProcessing(result.result, now(), lastTxId, reason = result.message)
+            it.logProcessing(succeeded, now(), lastSubmittedTxId, reason = reason)
         }
     }
 
@@ -206,14 +210,19 @@ class PaymentExternalSystemAdapterImpl(
         if (deadline <= now()) {
             return AttemptResult(failure(paymentId, transactionId, "Payment deadline expired"), false)
         }
-        var slotAcquired = false
-        try {
-            // Ограничиваем максимальный параллелизм для аккаунта.
+        val minimumNeeded = if (enabledRetries) MIN_ATTEMPT_MS else providerBudgetMs
+        if (attempt > 1) {
+            val slotWaitMs = deadline - now() - minimumNeeded - RESERVE_MS
+            if (slotWaitMs <= 0L || !parallelWindow.tryAcquire(slotWaitMs)) {
+                skippedRetryCounter.increment()
+                return AttemptResult(failure(paymentId, transactionId, "Payment deadline: no retry slot available"), false)
+            }
+        } else {
             parallelWindow.acquire()
-            slotAcquired = true
+        }
 
+        try {
             val remaining = deadline - now()
-            val minimumNeeded = if (enabledRetries) MIN_ATTEMPT_MS else providerBudgetMs
             val waitBudget = remaining - minimumNeeded - RESERVE_MS
             if (waitBudget <= 0L || !acquireRatePermit(waitBudget)) {
                 return AttemptResult(failure(paymentId, transactionId, "Insufficient time for rate limiter"), false)
@@ -224,24 +233,14 @@ class PaymentExternalSystemAdapterImpl(
                 return AttemptResult(failure(paymentId, transactionId, "Not enough time to process payment"), false)
             }
 
-            // Не делим бюджет поровну на 3 попытки: это давало ~1.55 с первой
-            // попытке, повышая вероятность HTTP 408 и создавая лишние retries.
-            // Берём до 1.8 с СЕЙЧАС, оставляя на каждую будущую попытку хотя бы
-            // 1.3 с и 135 мс на исходящий rate limiter. Не выходим за deadline.
+            // Оставляем время только на те повторы, которые помещаются в бюджет.
             val perAttemptMs = if (enabledRetries) {
-                val futureMinimum = (attemptsLeft - 1) *
-                        (MIN_ATTEMPT_MS + ACC7_SPACING_MS)
-                val available = afterRateMs - FINAL_RESERVE_MS - futureMinimum
-                if (available < MIN_ATTEMPT_MS) {
-                    logger.warn(
-                        "[CASE7] ATTEMPT_SKIPPED paymentId={} attempt={} availableMs={} remainingMs={}",
-                        paymentId, attempt, available, afterRateMs
-                    )
-                    return AttemptResult(
-                        failure(paymentId, transactionId, "Not enough time to process payment"), false
-                    )
-                }
-                available.coerceAtMost(MAX_ATTEMPT_MS)
+                val available = afterRateMs - FINAL_RESERVE_MS
+                val retryMinimum = MIN_ATTEMPT_MS + ACC7_SPACING_MS
+                val retriesThatFit = minOf((attemptsLeft - 1).toLong(), (available - MIN_ATTEMPT_MS) / retryMinimum)
+                val attemptBudget = available - retriesThatFit * retryMinimum
+                val providerBudget = if (attempt > 1) minOf(attemptBudget, available - PROVIDER_MARGIN_MS) else attemptBudget
+                providerBudget.coerceAtMost(MAX_ATTEMPT_MS)
             } else {
                 0L
             }
@@ -255,19 +254,27 @@ class PaymentExternalSystemAdapterImpl(
                 append("&paymentId=").append(paymentId)
                 append("&amount=").append(amount)
                 if (enabledRetries) {
-                    // Передаём бюджет ПРОВАЙДЕРУ, а не ограничиваем им OkHttp.
                     // Duration.toString() выдаёт формат ISO-8601: PT1.591S.
                     append("&").append(PROVIDER_TIMEOUT_PARAMETER).append("=").append(Duration.ofMillis(perAttemptMs).toString())
                 }
             }
 
             val request = Request.Builder().url(requestUrl).post(emptyBody).build()
+            val call = client.newCall(request)
+            if (attempt > 1) {
+                val callBudgetMs = deadline - now() - FINAL_RESERVE_MS
+                if (callBudgetMs < MIN_ATTEMPT_MS) {
+                    skippedRetryCounter.increment()
+                    return AttemptResult(failure(paymentId, transactionId, "Not enough time to process payment"), false)
+                }
+                call.timeout().timeout(callBudgetMs, TimeUnit.MILLISECONDS)
+            }
             if (attempt > 1) retryCounter.increment()
             outgoingCounter.increment()
 
             val started = System.nanoTime()
             try {
-                return client.newCall(request).execute().use { http ->
+                return call.execute().use { http ->
                     val raw = http.body?.string()
                     val response = try {
                         mapper.readValue(raw, ExternalSysResponse::class.java)
@@ -308,7 +315,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         } finally {
-            if (slotAcquired) parallelWindow.release()
+            parallelWindow.release()
         }
     }
 
@@ -323,7 +330,7 @@ class PaymentExternalSystemAdapterImpl(
     override fun name() = properties.accountName
 }
 
-private class PacedLimiter(spacingMs: Long) {
+private class PacedLimiter(spacingMs: Long, private val rateLimiter: SlidingWindowRateLimiter) {
     private val lock = ReentrantLock(true)
     private val spacingNs = TimeUnit.MILLISECONDS.toNanos(spacingMs)
     private var nextNs = 0L
@@ -338,6 +345,8 @@ private class PacedLimiter(spacingMs: Long) {
             val waitNs = (nextNs - System.nanoTime()).coerceAtLeast(0)
             if (waitNs >= budgetNs) return false
             if (waitNs > 0) TimeUnit.NANOSECONDS.sleep(waitNs)
+            val remainingNs = TimeUnit.MILLISECONDS.toNanos(maxWait) - (System.nanoTime() - started)
+            if (remainingNs <= 0 || !rateLimiter.tickWithTimeout(TimeUnit.NANOSECONDS.toMillis(remainingNs))) return false
             nextNs = System.nanoTime() + spacingNs
             return true
         } finally {
