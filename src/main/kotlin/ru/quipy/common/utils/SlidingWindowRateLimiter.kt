@@ -56,18 +56,11 @@ class SlidingWindowRateLimiter(
         )
 
         val startedAt = System.nanoTime()
+        if (tick()) return true
 
         while (true) {
-            if (tick()) {
-                return true
-            }
-
-            val elapsedNanos = System.nanoTime() - startedAt
-            val remainingNanos = timeoutNanos - elapsedNanos
-
-            if (remainingNanos <= 0L) {
-                return false
-            }
+            val remainingNanos = timeoutNanos - (System.nanoTime() - startedAt)
+            if (remainingNanos <= 0L) return false
 
             try {
                 TimeUnit.NANOSECONDS.sleep(
@@ -77,6 +70,8 @@ class SlidingWindowRateLimiter(
                 Thread.currentThread().interrupt()
                 return false
             }
+            if (System.nanoTime() - startedAt >= timeoutNanos) return false
+            if (tick()) return true
         }
     }
 

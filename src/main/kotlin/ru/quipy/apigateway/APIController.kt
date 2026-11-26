@@ -1,6 +1,5 @@
 package ru.quipy.apigateway
 
-import jakarta.servlet.http.HttpServletResponse
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -67,8 +66,7 @@ class APIController {
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(
         @PathVariable orderId: UUID,
-        @RequestParam deadline: Long,
-        response: HttpServletResponse
+        @RequestParam deadline: Long
     ): PaymentSubmissionDto {
 
         val remainingMs = deadline - System.currentTimeMillis()
@@ -76,21 +74,18 @@ class APIController {
         val bucketSize = if (remainingMs >= 20_000L) 320 else 11
 
         if (!ingressLimiter.tick(bucketSize)) {
-            response.setHeader("Retry-After", "1")
-
             throw ResponseStatusException(
                 HttpStatus.TOO_MANY_REQUESTS,
                 "Ingress rate limit exceeded"
             )
         }
         val paymentId = UUID.randomUUID()
-        val order = orderRepository.findById(orderId)?.let {
-            orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
-            it
-        } ?: throw IllegalArgumentException("No such order $orderId")
+        val order = orderRepository.findById(orderId)
+            ?: throw IllegalArgumentException("No such order $orderId")
 
-
-        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline) {
+            orderRepository.save(order.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
+        }
         return PaymentSubmissionDto(createdAt, paymentId)
     }
 

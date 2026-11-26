@@ -10,6 +10,7 @@ import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
@@ -51,15 +52,19 @@ class OrderPayer {
         orderId: UUID,
         amount: Int,
         paymentId: UUID,
-        deadline: Long
+        deadline: Long,
+        onAdmitted: () -> Unit
     ): Long {
 
         incomingCounter.increment()
 
         val createdAt = System.currentTimeMillis()
+        val orderSaved = CompletableFuture<Boolean>()
 
         try {
             paymentExecutor.execute {
+                if (!orderSaved.join()) return@execute
+
                 val taskStarted = System.currentTimeMillis()
                 val queueWaitMs = taskStarted - createdAt
 
@@ -151,6 +156,13 @@ class OrderPayer {
             )
         }
 
+        var saved = false
+        try {
+            onAdmitted()
+            saved = true
+        } finally {
+            orderSaved.complete(saved)
+        }
         return createdAt
     }
 }

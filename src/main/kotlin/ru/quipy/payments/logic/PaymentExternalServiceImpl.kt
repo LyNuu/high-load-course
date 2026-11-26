@@ -1,5 +1,6 @@
 package ru.quipy.payments.logic
 
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Metrics
@@ -7,6 +8,7 @@ import io.micrometer.core.instrument.Timer
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import okio.BufferedSink
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
@@ -37,7 +39,16 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         private val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapterImpl::class.java)
         private val emptyBody = RequestBody.create(null, ByteArray(0))
+        private val oneShotEmptyBody = object : RequestBody() {
+            override fun contentType() = null
+            override fun contentLength() = 0L
+            override fun isOneShot() = true
+            override fun writeTo(sink: BufferedSink) = Unit
+        }
         private val mapper = ObjectMapper().registerKotlinModule()
+        private val timeoutResponseReader = mapper.reader()
+            .with(DeserializationFeature.FAIL_ON_READING_DUP_TREE_KEY)
+            .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
 
         private const val MAX_ATTEMPTS = 3
         private const val MIN_ATTEMPT_MS = 1_300L
@@ -53,11 +64,15 @@ class PaymentExternalSystemAdapterImpl(
 
     private val accountName = properties.accountName
     private val enabledRetries = serverTimeoutRetryEnabled && accountName == "acc-7"
-    private val providerBudgetMs = maxOf(1L, properties.averageProcessingTime.toMillis()) + PROVIDER_MARGIN_MS
+    private val minimumAttemptMs = if (enabledRetries) MIN_ATTEMPT_MS else 1L
+    private val waitReserveMs = if (enabledRetries) RESERVE_MS else 0L
+    private val finalReserveMs = if (enabledRetries) FINAL_RESERVE_MS else 0L
 
     // Запрещаем неявные повторные отправки HTTP-клиентом в режиме кейса 7.
     private val client = OkHttpClient.Builder()
         .retryOnConnectionFailure(!enabledRetries)
+        .followRedirects(!enabledRetries)
+        .followSslRedirects(!enabledRetries)
         .build()
 
     private val rateLimiter = SlidingWindowRateLimiter(
@@ -102,28 +117,23 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 val transactionId = UUID.randomUUID()
-                recordSubmission(paymentId, transactionId, paymentStartedAt, deadline)
-                lastSubmittedTxId = transactionId
-                lastResult = null
-
-                val attemptResult = try {
-                    performAttempt(
-                        paymentId = paymentId,
-                        transactionId = transactionId,
-                        amount = amount,
-                        deadline = deadline,
-                        attempt = attempt,
-                        attemptsLeft = maxAttempts - attempt + 1
-                    )
-                } catch (e: InterruptedIOException) {
-                    networkTimeoutCounter.increment()
-                    logger.warn(
-                        "[CASE7] NETWORK_TIMEOUT_NO_RETRY account={} paymentId={} attempt={} remainingMs={} error={}",
-                        accountName, paymentId, attempt, deadline - now(), e.javaClass.simpleName
-                    )
-                    lastResult = failure(paymentId, transactionId, "Request timeout.")
-                    break
+                if (attempt == 1) {
+                    recordSubmission(paymentId, transactionId, paymentStartedAt, deadline)
+                    lastSubmittedTxId = transactionId
                 }
+
+                val attemptResult = performAttempt(
+                    paymentId = paymentId,
+                    transactionId = transactionId,
+                    amount = amount,
+                    deadline = deadline,
+                    attempt = attempt,
+                    attemptsLeft = maxAttempts - attempt + 1
+                ) {
+                    recordSubmission(paymentId, transactionId, paymentStartedAt, deadline)
+                    lastSubmittedTxId = transactionId
+                    lastResult = null
+                } ?: break
 
                 lastResult = attemptResult.value
                 if (!attemptResult.retryable || attempt == maxAttempts) break
@@ -146,8 +156,9 @@ class PaymentExternalSystemAdapterImpl(
             failureReason = "Payment error: ${e.message ?: e.javaClass.simpleName}"
         }
 
-        val succeeded = lastResult?.result == true
-        val reason = if (lastResult == null) failureReason else lastResult.message
+        val result = lastResult
+        val succeeded = result?.result == true
+        val reason = if (result == null) failureReason else result.message
         if (!succeeded) {
             val message = reason.orEmpty()
             val failureType = when {
@@ -205,42 +216,42 @@ class PaymentExternalSystemAdapterImpl(
         amount: Int,
         deadline: Long,
         attempt: Int,
-        attemptsLeft: Int
-    ): AttemptResult {
-        if (deadline <= now()) {
-            return AttemptResult(failure(paymentId, transactionId, "Payment deadline expired"), false)
-        }
-        val minimumNeeded = if (enabledRetries) MIN_ATTEMPT_MS else providerBudgetMs
-        if (attempt > 1) {
-            val slotWaitMs = deadline - now() - minimumNeeded - RESERVE_MS
-            if (slotWaitMs <= 0L || !parallelWindow.tryAcquire(slotWaitMs)) {
+        attemptsLeft: Int,
+        recordRetry: () -> Unit
+    ): AttemptResult? {
+        fun skip(reason: String): AttemptResult? {
+            if (attempt > 1) {
                 skippedRetryCounter.increment()
-                return AttemptResult(failure(paymentId, transactionId, "Payment deadline: no retry slot available"), false)
+                logger.warn("[CASE7] RETRY_SKIPPED paymentId={} remainingMs={} reason={}", paymentId, deadline - now(), reason)
+                return null
             }
-        } else {
-            parallelWindow.acquire()
+            return AttemptResult(failure(paymentId, transactionId, reason), false)
+        }
+
+        val slotWaitMs = deadline - now() - minimumAttemptMs - waitReserveMs
+        if (slotWaitMs < 0L || !parallelWindow.tryAcquire(slotWaitMs)) {
+            return skip("Payment deadline: no concurrency slot available")
         }
 
         try {
-            val remaining = deadline - now()
-            val waitBudget = remaining - minimumNeeded - RESERVE_MS
-            if (waitBudget <= 0L || !acquireRatePermit(waitBudget)) {
-                return AttemptResult(failure(paymentId, transactionId, "Insufficient time for rate limiter"), false)
+            val waitBudget = deadline - now() - minimumAttemptMs - waitReserveMs
+            if (waitBudget < 0L || !acquireRatePermit(waitBudget)) {
+                return skip("Insufficient time for rate limiter")
             }
 
-            val afterRateMs = deadline - now()
-            if (afterRateMs <= FINAL_RESERVE_MS + minimumNeeded) {
-                return AttemptResult(failure(paymentId, transactionId, "Not enough time to process payment"), false)
+            val budgetStartedNs = System.nanoTime()
+            val callBudgetMs = deadline - now() - finalReserveMs
+            if (callBudgetMs < minimumAttemptMs) {
+                return skip("Not enough time to process payment")
             }
+            val callDeadlineNs = budgetStartedNs + TimeUnit.MILLISECONDS.toNanos(callBudgetMs)
 
             // Оставляем время только на те повторы, которые помещаются в бюджет.
             val perAttemptMs = if (enabledRetries) {
-                val available = afterRateMs - FINAL_RESERVE_MS
                 val retryMinimum = MIN_ATTEMPT_MS + ACC7_SPACING_MS
-                val retriesThatFit = minOf((attemptsLeft - 1).toLong(), (available - MIN_ATTEMPT_MS) / retryMinimum)
-                val attemptBudget = available - retriesThatFit * retryMinimum
-                val providerBudget = if (attempt > 1) minOf(attemptBudget, available - PROVIDER_MARGIN_MS) else attemptBudget
-                providerBudget.coerceAtMost(MAX_ATTEMPT_MS)
+                val retriesThatFit = minOf((attemptsLeft - 1).toLong(), (callBudgetMs - MIN_ATTEMPT_MS) / retryMinimum)
+                val attemptBudget = callBudgetMs - retriesThatFit * retryMinimum
+                minOf(attemptBudget, callBudgetMs - PROVIDER_MARGIN_MS, MAX_ATTEMPT_MS)
             } else {
                 0L
             }
@@ -259,42 +270,49 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
 
-            val request = Request.Builder().url(requestUrl).post(emptyBody).build()
+            val body = if (enabledRetries) oneShotEmptyBody else emptyBody
+            val request = Request.Builder().url(requestUrl).post(body).build()
             val call = client.newCall(request)
-            if (attempt > 1) {
-                val callBudgetMs = deadline - now() - FINAL_RESERVE_MS
-                if (callBudgetMs < MIN_ATTEMPT_MS) {
-                    skippedRetryCounter.increment()
-                    return AttemptResult(failure(paymentId, transactionId, "Not enough time to process payment"), false)
-                }
-                call.timeout().timeout(callBudgetMs, TimeUnit.MILLISECONDS)
+            if (callDeadlineNs - System.nanoTime() <= 0L) {
+                return skip("Not enough time to process payment")
             }
-            if (attempt > 1) retryCounter.increment()
+            call.timeout().deadlineNanoTime(callDeadlineNs)
+            if (attempt > 1) {
+                recordRetry()
+                retryCounter.increment()
+            }
             outgoingCounter.increment()
 
             val started = System.nanoTime()
             try {
                 return call.execute().use { http ->
                     val raw = http.body?.string()
+                    val isCase7Timeout = enabledRetries && http.code == 408
+                    val timeoutJson = if (isCase7Timeout) {
+                        try {
+                            timeoutResponseReader.readTree(raw)
+                        } catch (e: Exception) {
+                            logger.warn("[CASE7] INVALID_TIMEOUT_RESPONSE paymentId={}", paymentId, e)
+                            return@use AttemptResult(failure(paymentId, transactionId, "Invalid provider response"), false)
+                        }
+                    } else null
                     val response = try {
-                        mapper.readValue(raw, ExternalSysResponse::class.java)
+                        if (timeoutJson == null) {
+                            mapper.readValue(raw, ExternalSysResponse::class.java)
+                        } else {
+                            mapper.treeToValue(timeoutJson, ExternalSysResponse::class.java)
+                        }
                     } catch (e: Exception) {
                         logger.error("[CASE7] RESPONSE_PARSE_FAILED paymentId={} status={} body={}", paymentId, http.code, raw, e)
                         return@use AttemptResult(failure(paymentId, transactionId, "Invalid provider response"), false)
                     }
 
-                    val canRetry = if (enabledRetries && http.code == 408 && !response.result) {
-                        try {
-                            val json = mapper.readTree(raw)
-                            json.path("result").isBoolean &&
-                                    !json.path("result").asBoolean() &&
-                                    json.path("message").asText("").trim().equals("Timeout", true) &&
-                                    json.path("paymentId").asText("") == paymentId.toString() &&
-                                    json.path("transactionId").asText("") == transactionId.toString()
-                        } catch (_: Exception) {
-                            false
-                        }
-                    } else false
+                    val canRetry = timeoutJson != null &&
+                            timeoutJson.path("result").isBoolean &&
+                            !response.result &&
+                            timeoutJson.path("message").textValue()?.trim().equals("Timeout", ignoreCase = true) &&
+                            timeoutJson.path("paymentId").textValue() == paymentId.toString() &&
+                            timeoutJson.path("transactionId").textValue() == transactionId.toString()
 
                     if (http.code == 408) {
                         if (canRetry) confirmedTimeoutCounter.increment()
@@ -305,6 +323,13 @@ class PaymentExternalSystemAdapterImpl(
                     }
                     AttemptResult(response, canRetry)
                 }
+            } catch (e: InterruptedIOException) {
+                networkTimeoutCounter.increment()
+                logger.warn(
+                    "[CASE7] NETWORK_TIMEOUT_NO_RETRY account={} paymentId={} attempt={} remainingMs={} error={}",
+                    accountName, paymentId, attempt, deadline - now(), e.javaClass.simpleName
+                )
+                return AttemptResult(failure(paymentId, transactionId, "Request timeout."), false)
             } finally {
                 val elapsedNs = System.nanoTime() - started
                 providerHttpTimer.record(elapsedNs, TimeUnit.NANOSECONDS)
